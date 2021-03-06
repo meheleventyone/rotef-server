@@ -235,6 +235,32 @@ func removeUserFromGroup(u *user) {
 	if len(group.Members) == 0 {
 		log.Printf("Removing empty group: %v", group.ID)
 		delete(groups.GroupMap, group.ID)
+		return
+	}
+
+	u.RLock()
+	groupMessage := UserJoinedLeftGroupMessage{
+		ID:    UserLeftGroupMessageID,
+		Group: group.ID,
+		User: userInfo{
+			ID:       u.ID.String(),
+			Username: u.Username,
+		},
+	}
+	u.RUnlock()
+
+	for _, memberUUID := range group.Members {
+		users.RLock()
+		member := users.UserMap[memberUUID]
+		users.RUnlock()
+
+		if member == nil {
+			continue
+		}
+
+		member.Lock()
+		member.Connection.WriteJSON(groupMessage)
+		member.Unlock()
 	}
 }
 
