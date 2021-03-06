@@ -33,8 +33,8 @@ const (
 	// ConnectedMessageID sent to a user when they join the server, gives them a name
 	ConnectedMessageID = 1100
 
-	// InitRTCConnectionMessageID sent from a user when they want to start and RTC connection
-	InitRTCConnectionMessageID = 1200
+	// RTCSessionDescriptionMessageID sent from a user when they want to trade sessiond descriptions
+	RTCSessionDescriptionMessageID = 1200
 )
 
 const (
@@ -91,7 +91,7 @@ type rtcSessionDescription struct {
 	SDP  string `json:"sdp"`
 }
 
-type initRTCConnectionMessage struct {
+type rtcSessionDescriptionMessage struct {
 	ID           int                   `json:"id"`
 	SourceUserID string                `json:"source"`
 	TargetUserID string                `json:"target"`
@@ -332,8 +332,8 @@ func (u *user) processMessages() {
 			}
 
 			addUserToGroup(message.Group, u)
-		case InitRTCConnectionMessageID:
-			var message initRTCConnectionMessage
+		case RTCSessionDescriptionMessageID:
+			var message rtcSessionDescriptionMessage
 			json.Unmarshal(bytes, &message)
 
 			targetUUID, _ := uuid.Parse(message.TargetUserID)
