@@ -24,8 +24,17 @@ const (
 	// JoinedGroupMessageID sent to a user when they join a group
 	JoinedGroupMessageID = 1000
 
+	// UserJoinedGroupMessageID sent to all the other users in a group when someone joins
+	UserJoinedGroupMessageID = 1001
+
+	// UserLeftGroupMessageID sent to all the other users in a group when someone leaves
+	UserLeftGroupMessageID = 1002
+
 	// ConnectedMessageID sent to a user when they join the server, gives them a name
-	ConnectedMessageID = 1001
+	ConnectedMessageID = 1100
+
+	// InitRTCConnectionMessageID sent from a user when they want to start and RTC connection
+	InitRTCConnectionMessageID = 1200
 )
 
 const (
@@ -37,13 +46,13 @@ type user struct {
 	sync.RWMutex
 	Connection *websocket.Conn
 	Username   string
-	ID         string
+	ID         uuid.UUID
 	GroupID    string
 }
 
 type group struct {
 	ID      string
-	Members []string
+	Members []uuid.UUID
 }
 
 type messageID struct {
@@ -55,10 +64,38 @@ type startJoinGroupMessage struct {
 	Group string `json:"group"`
 }
 
-type connectedMessage struct {
-	ID       int    `json:"id"`
+type userInfo struct {
 	Username string `json:"name"`
-	UserID   string `json:"userid"`
+	ID       string `json:"id"`
+}
+
+type joinedGroupMessage struct {
+	ID      int        `json:"id"`
+	Group   string     `json:"group"`
+	Members []userInfo `json:"members"`
+}
+
+type UserJoinedLeftGroupMessage struct {
+	ID    int      `json:"id"`
+	Group string   `json:"group"`
+	User  userInfo `json:"userInfo"`
+}
+
+type connectedMessage struct {
+	ID   int      `json:"id"`
+	User userInfo `json:"userInfo"`
+}
+
+type rtcSessionDescription struct {
+	Type string `json:"type"`
+	SDP  string `json:"sdp"`
+}
+
+type initRTCConnectionMessage struct {
+	ID           int                   `json:"id"`
+	SourceUserID string                `json:"source"`
+	TargetUserID string                `json:"target"`
+	Offer        rtcSessionDescription `json:"offer"`
 }
 
 var upgrade = websocket.Upgrader{
@@ -73,8 +110,8 @@ var nextUserID uint64 = 0
 
 var users = struct {
 	sync.RWMutex
-	UserMap map[string]*user
-}{UserMap: make(map[string]*user)}
+	UserMap map[uuid.UUID]*user
+}{UserMap: make(map[uuid.UUID]*user)}
 
 var groups = struct {
 	sync.RWMutex
@@ -99,7 +136,7 @@ func addUserToGroup(groupID string, u *user) {
 	if g == nil {
 		g = &group{
 			ID:      groupID,
-			Members: make([]string, 0, MaxPlayersInGroup),
+			Members: make([]uuid.UUID, 0, MaxPlayersInGroup),
 		}
 
 		groups.GroupMap[groupID] = g
@@ -107,11 +144,63 @@ func addUserToGroup(groupID string, u *user) {
 		log.Printf("Created Group: %v", groupID)
 	}
 
-	g.Members = append(g.Members, u.ID)
+	if len(g.Members) == MaxPlayersInGroup {
+		// todo send full message
+		return
+	}
+
+	joinedMessage := joinedGroupMessage{
+		ID:      JoinedGroupMessageID,
+		Group:   groupID,
+		Members: make([]userInfo, 0, MaxPlayersInGroup),
+	}
+
+	for _, userID := range g.Members {
+		users.RLock()
+		user := users.UserMap[userID]
+		users.RUnlock()
+
+		user.RLock()
+		userInfo := userInfo{
+			ID:       user.ID.String(),
+			Username: user.Username,
+		}
+		user.RUnlock()
+
+		joinedMessage.Members = append(joinedMessage.Members, userInfo)
+	}
 
 	u.Lock()
+	u.Connection.WriteJSON(joinedMessage)
 	u.GroupID = groupID
 	u.Unlock()
+
+	u.RLock()
+	groupMessage := UserJoinedLeftGroupMessage{
+		ID:    UserJoinedGroupMessageID,
+		Group: groupID,
+		User: userInfo{
+			ID:       u.ID.String(),
+			Username: u.Username,
+		},
+	}
+	u.RUnlock()
+
+	for _, memberUUID := range g.Members {
+		users.RLock()
+		member := users.UserMap[memberUUID]
+		users.RUnlock()
+
+		if member == nil {
+			continue
+		}
+
+		member.Lock()
+		member.Connection.WriteJSON(groupMessage)
+		member.Unlock()
+	}
+
+	g.Members = append(g.Members, u.ID)
 
 	log.Printf("Added user %v %v to group %v", u.ID, u.Username, u.GroupID)
 }
@@ -164,7 +253,7 @@ func handleRequest(writer http.ResponseWriter, request *http.Request) {
 	client := user{
 		Connection: connection,
 		Username:   fmt.Sprintf("Player_%d", atomic.AddUint64(&nextUserID, 1)),
-		ID:         uuid.NewString(),
+		ID:         uuid.New(),
 	}
 
 	users.Lock()
@@ -172,11 +261,16 @@ func handleRequest(writer http.ResponseWriter, request *http.Request) {
 	users.Unlock()
 
 	connectMessage := connectedMessage{
-		ID:       ConnectedMessageID,
-		Username: client.Username,
-		UserID:   client.ID,
+		ID: ConnectedMessageID,
+		User: userInfo{
+			ID:       client.ID.String(),
+			Username: client.Username,
+		},
 	}
+
+	client.Lock()
 	client.Connection.WriteJSON(connectMessage)
+	client.Unlock()
 
 	go client.processMessages()
 }
@@ -206,7 +300,28 @@ func (u *user) processMessages() {
 			var message startJoinGroupMessage
 			json.Unmarshal(bytes, &message)
 
+			if message.Group == "" {
+				log.Printf("No group provided to start or join.")
+				continue
+			}
+
 			addUserToGroup(message.Group, u)
+		case InitRTCConnectionMessageID:
+			var message initRTCConnectionMessage
+			json.Unmarshal(bytes, &message)
+
+			targetUUID, _ := uuid.Parse(message.TargetUserID)
+			users.RLock()
+			target := users.UserMap[targetUUID]
+			users.RUnlock()
+
+			if target == nil {
+				return
+			}
+
+			target.Lock()
+			target.Connection.WriteMessage(websocket.TextMessage, bytes)
+			target.Unlock()
 		}
 	}
 
