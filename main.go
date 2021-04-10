@@ -35,11 +35,18 @@ const (
 
 	// RTCSessionDescriptionMessageID sent from a user when they want to trade sessiond descriptions
 	RTCSessionDescriptionMessageID = 1200
+
+	// RTCICECandidateMessageID sent from a user when they want to trade sessiond descriptions
+	RTCICECandidateMessageID = 1201
+
+	// BroadcastMessageID - sent from a user and broadcast to the others in their group
+	BroadcastMessageID = 6666
 )
 
 const (
 	// MaxPlayersInGroup - bloop
 	MaxPlayersInGroup = 6
+	PingTime          = 30
 )
 
 type user struct {
@@ -48,6 +55,7 @@ type user struct {
 	Username   string
 	ID         uuid.UUID
 	GroupID    string
+	PingTicker *time.Ticker
 }
 
 type group struct {
@@ -75,7 +83,7 @@ type joinedGroupMessage struct {
 	Members []userInfo `json:"members"`
 }
 
-type UserJoinedLeftGroupMessage struct {
+type userJoinedLeftGroupMessage struct {
 	ID    int      `json:"id"`
 	Group string   `json:"group"`
 	User  userInfo `json:"userInfo"`
@@ -86,16 +94,10 @@ type connectedMessage struct {
 	User userInfo `json:"userInfo"`
 }
 
-type rtcSessionDescription struct {
-	Type string `json:"type"`
-	SDP  string `json:"sdp"`
-}
-
-type rtcSessionDescriptionMessage struct {
-	ID           int                   `json:"id"`
-	SourceUserID string                `json:"source"`
-	TargetUserID string                `json:"target"`
-	Offer        rtcSessionDescription `json:"offer"`
+type rtcForwardedMessage struct {
+	ID           int    `json:"id"`
+	SourceUserID string `json:"source"`
+	TargetUserID string `json:"target"`
 }
 
 var upgrade = websocket.Upgrader{
@@ -104,7 +106,8 @@ var upgrade = websocket.Upgrader{
 	CheckOrigin:     checkOrigin,
 }
 
-var address = flag.String("address", "localhost:8081", "HTTP Server Address")
+var address = flag.String("address", ":3123", "HTTP Server Address")
+var local = flag.Bool("local", false, "Are we running locally or not. Disables origin checks etc.")
 
 var nextUserID uint64 = 0
 
@@ -176,7 +179,7 @@ func addUserToGroup(groupID string, u *user) {
 	u.Unlock()
 
 	u.RLock()
-	groupMessage := UserJoinedLeftGroupMessage{
+	groupMessage := userJoinedLeftGroupMessage{
 		ID:    UserJoinedGroupMessageID,
 		Group: groupID,
 		User: userInfo{
@@ -239,7 +242,7 @@ func removeUserFromGroup(u *user) {
 	}
 
 	u.RLock()
-	groupMessage := UserJoinedLeftGroupMessage{
+	groupMessage := userJoinedLeftGroupMessage{
 		ID:    UserLeftGroupMessageID,
 		Group: group.ID,
 		User: userInfo{
@@ -265,11 +268,17 @@ func removeUserFromGroup(u *user) {
 }
 
 func checkOrigin(request *http.Request) bool {
-	// todo make this better
-	return true
+	if *local {
+		return true
+	}
+
+	origin := request.Header.Get("Origin")
+	log.Printf("Origin from: %v", origin)
+	return origin == "https://returnofthefist.com"
 }
 
 func handleRequest(writer http.ResponseWriter, request *http.Request) {
+	log.Print("Incoming connection")
 	connection, err := upgrade.Upgrade(writer, request, nil)
 	if err != nil {
 		log.Print("Failed to upgrade connection to WebSockets: ", err)
@@ -280,6 +289,7 @@ func handleRequest(writer http.ResponseWriter, request *http.Request) {
 		Connection: connection,
 		Username:   fmt.Sprintf("Player_%d", atomic.AddUint64(&nextUserID, 1)),
 		ID:         uuid.New(),
+		PingTicker: time.NewTicker(PingTime * time.Second),
 	}
 
 	users.Lock()
@@ -298,7 +308,17 @@ func handleRequest(writer http.ResponseWriter, request *http.Request) {
 	client.Connection.WriteJSON(connectMessage)
 	client.Unlock()
 
+	go client.processPing()
 	go client.processMessages()
+}
+
+func (u *user) processPing() {
+	for {
+		<-u.PingTicker.C
+		u.Lock()
+		u.Connection.WriteMessage(websocket.PingMessage, nil)
+		u.Unlock()
+	}
 }
 
 func (u *user) processMessages() {
@@ -332,8 +352,8 @@ func (u *user) processMessages() {
 			}
 
 			addUserToGroup(message.Group, u)
-		case RTCSessionDescriptionMessageID:
-			var message rtcSessionDescriptionMessage
+		case RTCSessionDescriptionMessageID, RTCICECandidateMessageID:
+			var message rtcForwardedMessage
 			json.Unmarshal(bytes, &message)
 
 			targetUUID, _ := uuid.Parse(message.TargetUserID)
